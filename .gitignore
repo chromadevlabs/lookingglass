@@ -3,3 +3,5 @@
 .vscode
 .zed
 build
+.DS_Store
+release_build

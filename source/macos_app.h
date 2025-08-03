@@ -1,8 +1,6 @@
 #pragma once
 
 #import <Cocoa/Cocoa.h>
-#include <Foundation/Foundation.h>
-#include <Foundation/NSString.h>
 #import <WebKit/WebKit.h>
 
 #include "webviewinterface.h"
@@ -42,9 +40,7 @@ static auto createNSURLResponse(int code,
 
 struct WebViewInterface::Impl
 {
-    Impl(WKWebView* view) : webView(view)
-    {
-    }
+    Impl(WKWebView* view) : webView(view) { }
 
     ~Impl() = default;
 
@@ -59,6 +55,22 @@ WebViewInterface::~WebViewInterface()
 auto WebViewInterface::getPreferences() const -> Preferences
 {
     return {};
+}
+
+static auto stdFunctionToDispatchBlock(std::function<void()>&& callback) -> dispatch_block_t
+{
+    auto cb = std::move(callback); // force block to capture by copy
+    return dispatch_block_create((dispatch_block_flags_t) 0, ^
+        {
+            cb();
+        });
+}
+
+auto WebViewInterface::callOnMessageThread(std::function<void()>&& callback) -> void
+{
+    dispatch_after(DISPATCH_TIME_NOW,
+                   dispatch_get_main_queue(),
+                   stdFunctionToDispatchBlock(std::move(callback)));
 }
 
 auto WebViewInterface::execute(const std::string& script) -> void
@@ -82,6 +94,57 @@ auto WebViewInterface::loadHtml(const std::string& html) -> void
     NSString* htmlString = stdStringToNsString(html);
     [impl->webView loadHTMLString:htmlString
                           baseURL:nil];
+}
+
+auto WebViewInterface::makeTimer(int milliseconds, std::function<void()>&& function) -> std::unique_ptr<Timer>
+{
+    struct NativeTimer : Timer
+    {
+        NativeTimer(int milliseconds, std::function<void()>&& callback) : function(std::move(callback))
+        {
+            start(milliseconds);
+        }
+
+        ~NativeTimer()
+        {
+            stop();
+        }
+
+        auto start(int milliseconds) -> void override
+        {
+            stop();
+
+            const auto interval = milliseconds / (double) 1000;
+            timer = [NSTimer timerWithTimeInterval:interval
+                             repeats:YES
+                             block:^(NSTimer*)
+                             {
+                                 function();
+                             }];
+
+            [[NSRunLoop currentRunLoop] addTimer:timer
+                                         forMode:NSDefaultRunLoopMode];
+        }
+
+        auto stop() -> void override
+        {
+            if (! timer)
+                return;
+
+            [timer invalidate];
+            timer = nullptr;
+        }
+
+        auto tick() -> void override
+        {
+            function();
+        }
+
+        std::function<void()> function;
+        NSTimer* timer;
+    };
+
+    return std::make_unique<NativeTimer>(milliseconds, std::move(function));
 }
 
 static auto idToJson(id data)           -> nlohmann::json;
@@ -171,9 +234,10 @@ static auto idToJson(id data) -> nlohmann::json
     - (void) webView:(WKWebView*) webView startURLSchemeTask:(id<WKURLSchemeTask>) task
     {
         const auto* nsRequest = [task request];
+
         UrlRequest request
         {
-            .path = nsStringToStdString(nsRequest.URL.path)
+            .path = nsStringToStdString(nsRequest.URL.absoluteString)
         };
 
         if (auto response = _webViewInterface->onUrlRequest(request))
@@ -227,24 +291,21 @@ static auto idToJson(id data) -> nlohmann::json
 
         WKWebViewConfiguration* configuration = [[WKWebViewConfiguration alloc] init];
 
-        //[configuration.preferences setValue:@(YES) forKey:@"developerExtrasEnabled"];
-        //[configuration.preferences setValue:@(NO) forKey:@"inspectorUsesCustomAppearance"];
-
         const auto prefs = _webViewInterface->getPreferences();
-        configuration.preferences.minimumFontSize = prefs.minimumFontSize;
-        configuration.preferences.shouldPrintBackgrounds = prefs.shouldPrintbackgrounds;
-        configuration.preferences.tabFocusesLinks = prefs.tabFocusesLinks;
-        configuration.preferences.textInteractionEnabled = prefs.isTextInteractionEnabled;
-        configuration.preferences.elementFullscreenEnabled = prefs.isElementFullscreenEnabled;
+        configuration.preferences.minimumFontSize                       = prefs.minimumFontSize;
+        configuration.preferences.shouldPrintBackgrounds                = prefs.shouldPrintbackgrounds;
+        configuration.preferences.tabFocusesLinks                       = prefs.tabFocusesLinks;
+        configuration.preferences.textInteractionEnabled                = prefs.isTextInteractionEnabled;
+        configuration.preferences.elementFullscreenEnabled              = prefs.isElementFullscreenEnabled;
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = prefs.scriptsCanOpenWindows;
-        configuration.preferences.fraudulentWebsiteWarningEnabled = prefs.fraudWarningsEnabled;
+        configuration.preferences.fraudulentWebsiteWarningEnabled       = prefs.fraudWarningsEnabled;
 
-        _scriptMessageHandler = [[MyCustomScriptMessageHandler alloc] init];
+        _scriptMessageHandler                  = [[MyCustomScriptMessageHandler alloc] init];
         _scriptMessageHandler.webViewInterface = _webViewInterface;
         [configuration.userContentController addScriptMessageHandler:_scriptMessageHandler
                                                                 name:@"local"];
 
-        _urlSchemeHandler = [[MyCustomUrlSchemeHandler alloc] init];
+        _urlSchemeHandler                  = [[MyCustomUrlSchemeHandler alloc] init];
         _urlSchemeHandler.webViewInterface = _webViewInterface;
         [configuration setURLSchemeHandler:_urlSchemeHandler forURLScheme:@"local"];
 
@@ -259,7 +320,6 @@ static auto idToJson(id data) -> nlohmann::json
         _window.contentView = _webView;
         [_window makeKeyAndOrderFront:nil];
 
-        // Kick off our callback
         _webViewInterface->onStart();
     }
 
